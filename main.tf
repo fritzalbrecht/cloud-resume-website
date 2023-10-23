@@ -101,3 +101,168 @@ resource "aws_acm_certificate_validation" "cert_validation" {
   certificate_arn         = aws_acm_certificate.cert[0].arn
   validation_record_fqdns = [for record in aws_route53_record.acm_certificate_validation_records : record.fqdn]
 }
+
+#------------------------------------------------------------------------------
+# Dynamodb Table
+#------------------------------------------------------------------------------
+
+resource "aws_dynamodb_table_item" "visitor-count" {
+  table_name = aws_dynamodb_table.cloud-resume-visitor-count-table.name
+  hash_key   = aws_dynamodb_table.cloud-resume-visitor-count-table.hash_key
+
+  item = <<ITEM
+{
+  "ID": {"S": "Visitors"},
+  "Count": {"N": "0"}
+}
+ITEM
+}
+
+resource "aws_dynamodb_table" "cloud-resume-visitor-count-table" {
+  name           = "cloud-resume-visitor-count"
+  read_capacity  = 1
+  write_capacity = 1
+  hash_key       = "ID"
+
+  attribute {
+    name = "ID"
+    type = "S"
+  }
+}
+
+#------------------------------------------------------------------------------
+# Lambda Functions
+#------------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "assume_role" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "iam_for_cloud_resume_lambdas" {
+  name               = "iam_for_cloud_resume_lambdas"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_policy" "dynamodb_full_access_policy" {
+  name        = "dynamodb_full_access_policy"
+  description = "Policy for full access to DynamoDB"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action   = "dynamodb:*",
+        Effect   = "Allow",
+        Resource = "arn:aws:dynamodb:us-east-1:144131464452:table/*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_policy_attachment" "dynamodb_policy_attachment" {
+  name       = "dynamodb_policy_attachment"
+  policy_arn = aws_iam_policy.dynamodb_full_access_policy.arn
+  roles      = [aws_iam_role.iam_for_cloud_resume_lambdas.name]
+}
+
+data "archive_file" "postVisitors-lambda" {
+  type        = "zip"
+  source_file = "${path.module}/postVisitors/lambda_function.py"
+  output_path = "${path.module}/postVisitors/postVisitors_function_payload.zip"
+}
+
+data "archive_file" "getVisitors-lambda" {
+  type        = "zip"
+  source_file = "${path.module}/getVisitors/lambda_function.py"
+  output_path = "${path.module}/getVisitors/getVisitors_function_payload.zip"
+}
+
+resource "aws_lambda_function" "postVisitors_lambda" {
+  filename      = "${path.module}/postVisitors/postVisitors_function_payload.zip"
+  function_name = "postVisitors-terraform"
+  role          = aws_iam_role.iam_for_cloud_resume_lambdas.arn
+  handler       = "lambda_function.lambda_handler"
+  timeout       = 10
+  runtime       = "python3.9"
+}
+
+resource "aws_lambda_function" "getVisitors_lambda" {
+  filename      = "${path.module}/getVisitors/getVisitors_function_payload.zip"
+  function_name = "getVisitors-terraform"
+  role          = aws_iam_role.iam_for_cloud_resume_lambdas.arn
+  handler       = "lambda_function.lambda_handler"
+  timeout       = 10
+  runtime       = "python3.9"
+}
+
+#------------------------------------------------------------------------------
+# API Gateway
+#------------------------------------------------------------------------------
+
+resource "aws_api_gateway_rest_api" "postVisitors_api" {
+  body = jsonencode({
+    openapi = "3.0.1"
+    info = {
+      title   = "postVisitors_api"
+      version = "1.0"
+    }
+    paths = {
+      "/POST" = {
+        post = {
+          x-amazon-apigateway-integration = {
+            httpMethod           = "POST"
+            payloadFormatVersion = "1.0"
+            type                 = "HTTP_PROXY"
+            uri                  = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+          }
+        }
+      }
+    }
+  })
+
+  name = "postVisitors_api"
+
+  endpoint_configuration {
+    types = ["REGIONAL"]
+  }
+}
+
+resource "aws_api_gateway_deployment" "postVisitors_api" {
+  rest_api_id = aws_api_gateway_rest_api.postVisitors_api.id
+
+  triggers = {
+    redeployment = sha1(jsonencode(aws_api_gateway_rest_api.postVisitors_api.body))
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "postVisitors_api" {
+  deployment_id = aws_api_gateway_deployment.postVisitors_api.id
+  rest_api_id   = aws_api_gateway_rest_api.postVisitors_api.id
+  stage_name    = "prod"
+}
+
+resource "aws_cloudwatch_log_group" "api_gw" {
+  name = "/aws/api_gw/${aws_api_gateway_rest_api.postVisitors_api.name}"
+
+  retention_in_days = 30
+}
+
+resource "aws_lambda_permission" "api_gw" {
+  statement_id  = "AllowExecutionFromAPIGateway"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.postVisitors_lambda.function_name
+  principal     = "apigateway.amazonaws.com"
+
+  source_arn = "${aws_api_gateway_rest_api.postVisitors_api.execution_arn}/*/*"
+}

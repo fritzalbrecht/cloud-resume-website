@@ -3,6 +3,8 @@
 #------------------------------------------------------------------------------
 variable "name_prefix" {
   description = "Name prefix for resources on AWS"
+  type        = string
+  default     = "cloud-resume"
 }
 
 variable "tags" {
@@ -44,6 +46,7 @@ variable "aws_accounts_with_read_view_log_bucket" {
 variable "website_domain_name" {
   description = "The domain name to use for the website"
   type        = string
+  default     = "fritzalbrecht.com"
 }
 
 variable "website_bucket_acl" {
